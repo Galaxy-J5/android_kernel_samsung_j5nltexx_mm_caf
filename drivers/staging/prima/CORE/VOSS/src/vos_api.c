@@ -2943,7 +2943,6 @@ v_VOID_t vos_init_work(struct work_struct *work , void *callbackptr)
 {
 #if defined (WLAN_OPEN_SOURCE)
    INIT_WORK(work,callbackptr);
-#else
    wcnss_init_work(work, callbackptr);
 #endif
 }
@@ -2952,7 +2951,6 @@ v_VOID_t vos_init_delayed_work(struct delayed_work *dwork , void *callbackptr)
 {
 #if defined (WLAN_OPEN_SOURCE)
    INIT_DELAYED_WORK(dwork,callbackptr);
-#else
    wcnss_init_delayed_work(dwork, callbackptr);
 #endif
 }
