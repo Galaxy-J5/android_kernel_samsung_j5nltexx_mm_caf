@@ -1733,8 +1733,14 @@ static int wcnss_wlan_suspend(struct device *dev)
 {
 	if (penv && dev && (dev == &penv->pdev->dev) &&
 	    penv->smd_channel_ready &&
-	    penv->pm_ops && penv->pm_ops->suspend)
-		return penv->pm_ops->suspend(dev);
+	    penv->pm_ops && penv->pm_ops->suspend) 
+	{
+#if defined(CONFIG_MACH_A5U_EUR_OPEN)
+	    wcnss_ldo18_off();
+	    pr_err("wcnss: wcnss_ldo18_off!!\n");
+#endif
+	    return penv->pm_ops->suspend(dev);
+	}
 	return 0;
 }
 
@@ -1742,8 +1748,14 @@ static int wcnss_wlan_resume(struct device *dev)
 {
 	if (penv && dev && (dev == &penv->pdev->dev) &&
 	    penv->smd_channel_ready &&
-	    penv->pm_ops && penv->pm_ops->resume)
-		return penv->pm_ops->resume(dev);
+	    penv->pm_ops && penv->pm_ops->resume) 
+	{
+#if defined(CONFIG_MACH_A5U_EUR_OPEN)
+	    wcnss_ldo18_on();
+	    pr_err("wcnss: wcnss_ldo18_on!!\n");
+#endif
+	    return penv->pm_ops->resume(dev);
+	}
 	return 0;
 }
 
@@ -2649,11 +2661,41 @@ static ssize_t wcnss_ctrl_write(struct file *fp, const char __user
 	return rc;
 }
 
+static ssize_t wcnss_ctrl_read(struct file *fp, char __user *user_buffer,
+			size_t count, loff_t *position)
+{
+	int rc = 0;
+
+	if (!penv || !penv->device_opened)
+		return -EFAULT;
+
+	rc = wait_event_interruptible(penv->wlan_config.wcnss_ctrl_wait,
+		(penv->wlan_config.irisStatus == IRIS_DETECTION_SUCCESS
+		|| penv->wlan_config.irisStatus == IRIS_DETECTION_FAIL));
+
+	if (rc < 0)
+		return rc;
+
+	mutex_lock(&penv->ctrl_lock);
+	count = sizeof(penv->wlan_config.irisStatus);
+
+	rc = copy_to_user(user_buffer,
+			(void *)&(penv->wlan_config.irisStatus), count);
+
+	mutex_unlock(&penv->ctrl_lock);
+
+	pr_info("%s: iris detection status: %d\n", __func__,
+	penv->wlan_config.irisStatus);
+
+	return rc;
+}
+
 
 static const struct file_operations wcnss_ctrl_fops = {
 	.owner = THIS_MODULE,
 	.open = wcnss_ctrl_open,
 	.write = wcnss_ctrl_write,
+	.read = wcnss_ctrl_read,
 };
 
 static struct miscdevice wcnss_usr_ctrl = {
@@ -3029,6 +3071,19 @@ wcnss_trigger_config(struct platform_device *pdev)
 		}
 	}
 
+	
+	snoc_qosgen = clk_get(&pdev->dev, "snoc_qosgen");
+
+	if (IS_ERR(snoc_qosgen)) {
+		pr_err("Couldn't get snoc_qosgen\n");
+	} else {
+		if (clk_prepare_enable(snoc_qosgen)) {
+			pr_err("snoc_qosgen enable failed\n");
+		} else {
+			pr_info("snoc_qosgen configured successfully\n");
+		}
+	}
+	
 	do {
 		/* trigger initialization of the WCNSS */
 		penv->pil = subsystem_get(WCNSS_PIL_DEVICE);
@@ -3086,16 +3141,6 @@ void wcnss_flush_work(struct work_struct *work)
 		cancel_work_sync(cnss_work);
 }
 EXPORT_SYMBOL(wcnss_flush_work);
-
-/* wlan prop driver cannot invoke show_stack
- * function directly, so to invoke this function it
- * call wcnss_dump_stack function
- */
-void wcnss_dump_stack(struct task_struct *task)
-{
-	show_stack(task, NULL);
-}
-EXPORT_SYMBOL(wcnss_dump_stack);
 
 /* wlan prop driver cannot invoke cancel_delayed_work_sync
  * function directly, so to invoke this function it call
@@ -3206,7 +3251,7 @@ static ssize_t wcnss_wlan_write(struct file *fp, const char __user
 		return -EFAULT;
 
 	if ((UINT32_MAX - count < penv->user_cal_rcvd) ||
-	     MAX_CALIBRATED_DATA_SIZE < count + penv->user_cal_rcvd) {
+	     (penv->user_cal_exp_size < count + penv->user_cal_rcvd)) {
 		pr_err(DEVICE " invalid size to write %zu\n", count +
 				penv->user_cal_rcvd);
 		rc = -ENOMEM;
@@ -3331,6 +3376,7 @@ wcnss_wlan_probe(struct platform_device *pdev)
 	mutex_init(&penv->vbat_monitor_mutex);
 	mutex_init(&penv->pm_qos_mutex);
 	init_waitqueue_head(&penv->read_wait);
+	init_waitqueue_head(&penv->wlan_config.wcnss_ctrl_wait);
 
 	/* Since we were built into the kernel we'll be called as part
 	 * of kernel initialization.  We don't know if userspace

@@ -54,6 +54,11 @@
 #include "mdss_fb.h"
 #include "mdss_mdp_splash_logo.h"
 
+#if defined(CONFIG_FB_MSM_MDSS_SAMSUNG)
+#include "samsung/ss_dsi_panel_common.h" /* UTIL HEADER */
+#endif
+
+
 #ifdef CONFIG_FB_MSM_TRIPLE_BUFFER
 #define MDSS_FB_NUM 3
 #else
@@ -266,7 +271,7 @@ static void mdss_fb_set_bl_brightness(struct led_classdev *led_cdev,
 
 static struct led_classdev backlight_led = {
 	.name           = "lcd-backlight",
-	.brightness     = MDSS_MAX_BL_BRIGHTNESS,
+	.brightness 	= MDSS_MAX_BL_BRIGHTNESS / 2,
 	.brightness_set = mdss_fb_set_bl_brightness,
 	.max_brightness = MDSS_MAX_BL_BRIGHTNESS,
 };
@@ -433,7 +438,11 @@ static ssize_t mdss_fb_set_thermal_level(struct device *dev,
 
 	pr_debug("Thermal level set to %d\n", thermal_level);
 	mfd->thermal_level = thermal_level;
-	sysfs_notify(&mfd->fbi->dev->kobj, NULL, "msm_fb_thermal_level");
+
+	if(mfd->panel_power_state == MDSS_PANEL_POWER_OFF)
+		pr_err("mdss_fb_set_thermal_level called at panel off status\n");
+	else
+		sysfs_notify(&mfd->fbi->dev->kobj, NULL, "msm_fb_thermal_level");
 
 	return count;
 }
@@ -737,6 +746,10 @@ static void mdss_fb_shutdown(struct platform_device *pdev)
 	mfd->shutdown_pending = true;
 	lock_fb_info(mfd->fbi);
 	mdss_fb_release_all(mfd->fbi, true);
+
+	if(mfd->panel_power_state == MDSS_PANEL_POWER_OFF)
+		pr_info("mdss_fb_shutdown called at panel off status\n");
+
 	sysfs_notify(&mfd->fbi->dev->kobj, NULL, "show_blank_event");
 	unlock_fb_info(mfd->fbi);
 }
@@ -782,7 +795,12 @@ static int mdss_fb_probe(struct platform_device *pdev)
 	mfd->mdp_fb_page_protection = MDP_FB_PAGE_PROTECTION_WRITECOMBINE;
 
 	mfd->ext_ad_ctrl = -1;
-	mfd->bl_level = 0;
+	if (mfd->panel_info && mfd->panel_info->brightness_max > 0)
+		MDSS_BRIGHT_TO_BL(mfd->bl_level, backlight_led.brightness,
+				mfd->panel_info->bl_max, mfd->panel_info->brightness_max);
+	else
+		mfd->bl_level = 0;
+
 	mfd->bl_scale = 1024;
 	mfd->bl_min_lvl = 30;
 	mfd->ad_bl_level = 0;
@@ -1296,6 +1314,7 @@ static int mdss_fb_blank_blank(struct msm_fb_data_type *mfd,
 {
 	int ret = 0;
 	int cur_power_state;
+	int current_bl = 0;
 
 	if (!mfd)
 		return -EINVAL;
@@ -1328,8 +1347,10 @@ static int mdss_fb_blank_blank(struct msm_fb_data_type *mfd,
 		if (mfd->disp_thread)
 			mdss_fb_stop_disp_thread(mfd);
 		mutex_lock(&mfd->bl_lock);
+		current_bl = mfd->bl_level;
 		mdss_fb_set_backlight(mfd, 0);
 		mfd->bl_updated = 0;
+		mfd->unset_bl_level = current_bl;
 		mutex_unlock(&mfd->bl_lock);
 	}
 	mfd->panel_power_state = req_power_state;
@@ -1401,6 +1422,9 @@ static int mdss_fb_blank_sub(int blank_mode, struct fb_info *info,
 	struct msm_fb_data_type *mfd = (struct msm_fb_data_type *)info->par;
 	int ret = 0;
 	int cur_power_state, req_power_state = MDSS_PANEL_POWER_OFF;
+#if defined(CONFIG_FB_MSM_MDSS_SAMSUNG)
+	struct samsung_display_driver_data *vdd = samsung_get_vdd();
+#endif
 
 	if (!mfd || !op_enable)
 		return -EPERM;
@@ -1433,6 +1457,11 @@ static int mdss_fb_blank_sub(int blank_mode, struct fb_info *info,
 				blank_mode = FB_BLANK_POWERDOWN;
 		}
 	}
+#if defined(CONFIG_FB_MSM_MDSS_SAMSUNG)
+		if (info->node <= (SUPPORT_PANEL_COUNT - 1))
+					vdd->vdd_blank_mode[info->node] =  blank_mode;
+#endif
+
 
 	switch (blank_mode) {
 	case FB_BLANK_UNBLANK:
@@ -1476,6 +1505,9 @@ static int mdss_fb_blank_sub(int blank_mode, struct fb_info *info,
 	}
 
 	/* Notify listeners */
+	if(mfd->panel_power_state == MDSS_PANEL_POWER_OFF)
+		pr_info("mdss_fb_blank_sub called at panel off status\n");
+
 	sysfs_notify(&mfd->fbi->dev->kobj, NULL, "show_blank_event");
 
 	return ret;
@@ -2064,7 +2096,11 @@ static int mdss_fb_register(struct msm_fb_data_type *mfd)
 	var->right_margin = panel_info->lcdc.h_front_porch;
 	var->hsync_len = panel_info->lcdc.h_pulse_width;
 	var->pixclock = panel_info->clk_rate / 1000;
-
+#if defined(CONFIG_PANEL_S6D7AA0_LTL101AT01_WXGA) || defined(CONFIG_PANEL_S6D7AA0_LSL080AL03_WXGA)
+	/*Temperary change to support XGA resolution*/
+	var->xres = 768;
+	var->yres = 1024;
+#endif
 	/*
 	 * Store the cont splash state in the var reserved[3] field.
 	 * The continuous splash is considered to be active if either
@@ -3669,3 +3705,22 @@ int mdss_fb_suspres_panel(struct device *dev, void *data)
 	}
 	return rc;
 }
+
+#if defined(CONFIG_FB_MSM_MDSS_SAMSUNG)
+void mdss_samsung_update_brightness_value(void)
+{
+	int bl_lvl;
+	struct samsung_display_driver_data *vdd = samsung_get_vdd();
+	struct msm_fb_data_type *mfd = dev_get_drvdata(backlight_led.dev->parent);
+
+	if((vdd->bl_level == 0) && (backlight_led.brightness != 0)) {
+		MDSS_BRIGHT_TO_BL(bl_lvl, backlight_led.brightness, mfd->panel_info->bl_max,
+				mfd->panel_info->brightness_max);
+		if (!IS_CALIB_MODE_BL(mfd))
+			mdss_fb_scale_bl(mfd, &bl_lvl);
+		vdd->bl_level = bl_lvl;
+	}
+}
+EXPORT_SYMBOL(mdss_samsung_update_brightness_value);
+#endif
+

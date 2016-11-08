@@ -12,7 +12,7 @@
     MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
     GNU General Public License for more details.
 
-    You should have received a copy of the GNU General Public License
+    You should have received a copy of the GNU General Public LicenseCONFIG_KALLSYMS
     along with this program; if not, write to the Free Software
     Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
 */
@@ -63,9 +63,88 @@
 #include <linux/fips.h>
 #include <uapi/linux/module.h>
 #include "module-internal.h"
-
+#ifdef	CONFIG_TIMA_LKMAUTH_CODE_PROT
+#include <asm/tlbflush.h>
+#endif/*CONFIG_TIMA_LKMAUTH_CODE_PROT*/
 #define CREATE_TRACE_POINTS
 #include <trace/events/module.h>
+#ifdef	CONFIG_TIMA_LKMAUTH_CODE_PROT
+#define TIMA_PAC_CMD_ID 0x3f80d221
+#define TIMA_SET_PTE_RO 1
+#define TIMA_SET_PTE_NX 2
+#endif/*CONFIG_TIMA_LKMAUTH_CODE_PROT*/
+
+#ifdef CONFIG_TIMA_LKMAUTH
+#include <linux/qseecom.h>
+#include <linux/kobject.h>
+#include <linux/spinlock.h>
+
+#define CONFIG_LKMAUTH_SECONDWAY
+#ifdef CONFIG_LKMAUTH_SECONDWAY
+#define LKM_MAGIC 0x11223344
+#endif
+
+#define QSEECOM_ALIGN_SIZE  0x40
+#define QSEECOM_ALIGN_MASK  (QSEECOM_ALIGN_SIZE - 1)
+#define QSEECOM_ALIGN(x)    \
+    ((x + QSEECOM_ALIGN_SIZE) & (~QSEECOM_ALIGN_MASK))
+
+struct qseecom_handle {
+    void *dev; /* in/out */
+    unsigned char *sbuf; /* in/out */
+    uint32_t sbuf_len; /* in/out */
+};
+
+struct qseecom_handle *qhandle = NULL;
+DEFINE_MUTEX(lkmauth_mutex);
+
+extern int qseecom_start_app(struct qseecom_handle **handle, char *app_name, uint32_t size);
+extern int qseecom_shutdown_app(struct qseecom_handle **handle);
+extern int qseecom_send_command(struct qseecom_handle *handle, void *send_buf, uint32_t sbuf_len, void *resp_buf, uint32_t rbuf_len);
+extern struct device *tima_uevent_dev;
+
+#define SVC_LKMAUTH_ID              0x00050000
+#define LKMAUTH_CREATE_CMD(x) (SVC_LKMAUTH_ID | x)
+
+#define MODULE_HASH_DIR "/system"
+#define MODULE_DIR "/system/lib/modules"
+
+#define HASH_ALGO QSEE_HASH_SHA1
+#define HASH_SIZE QSEE_SHA1_HASH_SZ
+
+/** 
+ * Commands for TZ LKMAUTH application. 
+ * */
+typedef enum
+{
+  LKMAUTH_CMD_AUTH        = LKMAUTH_CREATE_CMD(0x00000000),
+  LKMAUTH_CMD_UNKNOWN     = LKMAUTH_CREATE_CMD(0x7FFFFFFF)
+} lkmauth_cmd_type;
+
+/* Message types for every command - Add one here for every command you add */
+
+typedef struct lkmauth_req_s
+{
+  lkmauth_cmd_type cmd_id;
+  u32 module_addr_start;
+  u32 module_len;
+  u32 min;
+  u32 max;
+  char module_name [280];
+  int module_name_len;
+} __attribute__ ((packed)) lkmauth_req_t;
+
+typedef struct lkmauth_rsp_s
+{
+  /** First 4 bytes should always be command id */
+  lkmauth_cmd_type cmd_id;
+  int ret;
+  union {
+    unsigned char hash[20];
+    char result_ondemand[256];
+  }  __attribute__ ((packed)) result;
+} __attribute__ ((packed)) lkmauth_rsp_t;
+#endif
 
 #ifndef ARCH_SHF_SMALL
 #define ARCH_SHF_SMALL 0
@@ -76,11 +155,15 @@
  * to ensure complete separation of code and data, but
  * only when CONFIG_DEBUG_SET_MODULE_RONX=y
  */
+#ifdef	CONFIG_TIMA_LKMAUTH_CODE_PROT
+# define debug_align(X) ALIGN(X, PAGE_SIZE)
+#else
 #ifdef CONFIG_DEBUG_SET_MODULE_RONX
 # define debug_align(X) ALIGN(X, PAGE_SIZE)
 #else
 # define debug_align(X) (X)
 #endif
+#endif/*CONFIG_TIMA_LKMAUTH_CODE_PROT*/
 
 /*
  * Given BASE and SIZE this macro calculates the number of pages the
@@ -179,6 +262,9 @@ struct load_info {
 	struct _ddebug *debug;
 	unsigned int num_debug;
 	bool sig_ok;
+#ifdef CONFIG_KALLSYMS
+	unsigned long mod_kallsyms_init_off;
+#endif
 	struct {
 		unsigned int sym, str, mod, vers, info, pcpu;
 	} index;
@@ -2340,8 +2426,20 @@ static void layout_symtab(struct module *mod, struct load_info *info)
 	strsect->sh_entsize = get_offset(mod, &mod->init_size, strsect,
 					 info->index.str) | INIT_OFFSET_MASK;
 	pr_debug("\t%s\n", info->secstrings + strsect->sh_name);
+
+	/* We'll tack temporary mod_kallsyms on the end. */
+	mod->init_size = ALIGN(mod->init_size,
+				      __alignof__(struct mod_kallsyms));
+	info->mod_kallsyms_init_off = mod->init_size;
+	mod->init_size += sizeof(struct mod_kallsyms);
+	mod->init_size = debug_align(mod->init_size);
 }
 
+/*
+ * We use the full symtab and strtab which layout_symtab arranged to
+ * be appended to the init section.  Later we switch to the cut-down
+ * core-only ones.
+ */
 static void add_kallsyms(struct module *mod, const struct load_info *info)
 {
 	unsigned int i, ndst;
@@ -2350,28 +2448,33 @@ static void add_kallsyms(struct module *mod, const struct load_info *info)
 	char *s;
 	Elf_Shdr *symsec = &info->sechdrs[info->index.sym];
 
-	mod->symtab = (void *)symsec->sh_addr;
-	mod->num_symtab = symsec->sh_size / sizeof(Elf_Sym);
+	/* Set up to point into init section. */
+	mod->kallsyms = mod->module_init + info->mod_kallsyms_init_off;
+
+	mod->kallsyms->symtab = (void *)symsec->sh_addr;
+	mod->kallsyms->num_symtab = symsec->sh_size / sizeof(Elf_Sym);
 	/* Make sure we get permanent strtab: don't use info->strtab. */
-	mod->strtab = (void *)info->sechdrs[info->index.str].sh_addr;
-
+	mod->kallsyms->strtab = (void *)info->sechdrs[info->index.str].sh_addr;
+	
 	/* Set types up while we still have access to sections. */
-	for (i = 0; i < mod->num_symtab; i++)
-		mod->symtab[i].st_info = elf_type(&mod->symtab[i], info);
+	for (i = 0; i < mod->kallsyms->num_symtab; i++)
+		mod->kallsyms->symtab[i].st_info
+			= elf_type(&mod->kallsyms->symtab[i], info);
 
-	mod->core_symtab = dst = mod->module_core + info->symoffs;
-	mod->core_strtab = s = mod->module_core + info->stroffs;
-	src = mod->symtab;
-	for (ndst = i = 0; i < mod->num_symtab; i++) {
+	/* Now populate the cut down core kallsyms for after init. */
+	mod->core_kallsyms.symtab = dst = mod->module_core + info->symoffs;
+	mod->core_kallsyms.strtab = s = mod->module_core + info->stroffs;
+	src = mod->kallsyms->symtab;
+	for (ndst = i = 0; i < mod->kallsyms->num_symtab; i++) {
 		if (i == 0 ||
 		    is_core_symbol(src+i, info->sechdrs, info->hdr->e_shnum)) {
 			dst[ndst] = src[i];
-			dst[ndst++].st_name = s - mod->core_strtab;
-			s += strlcpy(s, &mod->strtab[src[i].st_name],
+			dst[ndst++].st_name = s - mod->core_kallsyms.strtab;
+			s += strlcpy(s, &mod->kallsyms->strtab[src[i].st_name],
 				     KSYM_NAME_LEN) + 1;
 		}
 	}
-	mod->core_num_syms = ndst;
+	mod->core_kallsyms.num_symtab = ndst;
 }
 #else
 static inline void layout_symtab(struct module *mod, struct load_info *info)
@@ -2382,6 +2485,182 @@ static void add_kallsyms(struct module *mod, const struct load_info *info)
 {
 }
 #endif /* CONFIG_KALLSYMS */
+
+#ifdef	CONFIG_TIMA_LKMAUTH
+static DEFINE_SPINLOCK(lkm_va_to_pa_lock);
+extern pid_t pid_from_lkm;
+#define LAST_TRY_CNT 4
+int qseecom_set_bandwidth(struct qseecom_handle *handle, bool high);
+static int lkmauth(Elf_Ehdr *hdr, int len, int cnt)
+{
+	int ret = 0; /* value to be returned for lkmauth */
+	int qsee_ret = 0; /* value used to capture qsee return state */
+	char *envp[3], *status, *result;
+	char app_name[MAX_APP_NAME_SIZE];
+	lkmauth_req_t *kreq = NULL;
+	lkmauth_rsp_t *krsp = NULL;
+	int req_len = 0, rsp_len = 0;
+#ifdef CONFIG_LKMAUTH_SECONDWAY
+	unsigned int par;
+	unsigned int virt_addr;
+	unsigned int *pBuf = NULL;
+	unsigned int *ptr;
+	unsigned int size;
+	unsigned long flags;
+#endif
+	mutex_lock(&lkmauth_mutex);
+	pr_warn("TIMA: lkmauth--launch the tzapp to check kernel module; module len is %d\n", len);
+
+	snprintf(app_name, MAX_APP_NAME_SIZE, "%s", "tima_lkm");
+    
+	if ( NULL == qhandle ) {
+		/* start the lkmauth tzapp only when it is not loaded. */
+		qsee_ret = qseecom_start_app(&qhandle, app_name, 1024);
+	}
+	if ( NULL == qhandle ) {
+		/* qhandle is still NULL. It seems we couldn't start lkmauth tzapp. */
+  		pr_err("TIMA: lkmauth--cannot get tzapp handle from kernel.\n");
+		ret = -1; /* lkm authentication failed. */
+  		goto lkmauth_ret; /* leave the function now. */
+	}
+	if (qsee_ret) {
+		/* Another way for lkmauth tzapp loading to fail. */
+  		pr_err("TIMA: lkmauth--cannot load tzapp from kernel; qsee_ret =  %d.\n", qsee_ret);
+		qhandle = NULL; /* Do we have a memory leak this way? */
+		ret = -1; /* lkm authentication failed. */
+		goto lkmauth_ret; /* leave the function now. */
+	}
+	
+	/* Generate the request cmd to verify hash of ko. 
+	 * Note that we are reusing the same buffer for both request and response, 
+	 * and the buffer is allocated in qhandle. 
+	 */
+	kreq = (struct lkmauth_req_s *)qhandle->sbuf;
+	kreq->cmd_id = LKMAUTH_CMD_AUTH; 
+	pr_warn("TIMA: lkmauth -- hdr before kreq is : %x\n", (u32)hdr);
+	kreq->module_len = len;
+#ifdef CONFIG_LKMAUTH_SECONDWAY
+	virt_addr = (u32)hdr;
+	size = ((len/PAGE_SIZE) + 2)*sizeof(pBuf);
+	pBuf = kmalloc(size, GFP_KERNEL);
+
+	if (pBuf == NULL) {
+		printk("lkmauth: failed to allocate memory %d \n", size);
+		goto lkmauth_ret;
+	}
+	ptr = pBuf;
+	*ptr = LKM_MAGIC;
+	ptr++;
+
+	do {
+		spin_lock_irqsave(&lkm_va_to_pa_lock, flags);
+		__asm__	("mcr	p15, 0, %1, c7, c8, 0\n"
+		"isb\n"
+		"mrc 	p15, 0, %0, c7, c4, 0\n"
+		:"=r"(par):"r"(virt_addr));
+
+		spin_unlock_irqrestore(&lkm_va_to_pa_lock, flags);
+		if(par & 0x1) {
+			printk("failed to translate va: %x \n", virt_addr);
+			goto lkmauth_ret;
+		}
+		//fix last 12 bits
+		*ptr = (unsigned int)(par & PAGE_MASK);
+		len = len - PAGE_SIZE;
+		virt_addr = virt_addr + PAGE_SIZE;
+		ptr++;
+	} while (len > 0);
+	kreq->module_addr_start = (u32)(unsigned long)(virt_to_phys(pBuf));
+#else
+	kreq->module_addr_start = (u32)hdr;
+#endif
+
+	req_len = sizeof(lkmauth_req_t);
+	if (req_len & QSEECOM_ALIGN_MASK)
+		req_len = QSEECOM_ALIGN(req_len);
+
+	/* prepare the response buffer */
+	krsp =(struct lkmauth_rsp_s *)(qhandle->sbuf + req_len);
+
+	rsp_len = sizeof(lkmauth_rsp_t);
+	if (rsp_len & QSEECOM_ALIGN_MASK)
+		rsp_len = QSEECOM_ALIGN(rsp_len);
+
+	pr_warn("TIMA: lkmauth--send cmd (%s) cmdlen(%d:%d), rsplen(%d:%d) id 0x%08X, \
+                req (0x%08X), rsp(0x%08X), module_start_addr(0x%08X) module_len %d\n", \
+		app_name, sizeof(lkmauth_req_t), req_len, sizeof(lkmauth_rsp_t), rsp_len, \
+		kreq->cmd_id, (int)kreq, (int)krsp, kreq->module_addr_start, kreq->module_len);
+
+	qseecom_set_bandwidth(qhandle, true);
+	pid_from_lkm = current->pid;
+	qsee_ret = qseecom_send_command(qhandle, kreq, req_len, krsp, rsp_len);
+	pid_from_lkm = -1;
+	qseecom_set_bandwidth(qhandle, false);
+
+	if (qsee_ret) {
+		pr_err("TIMA: lkmauth--failed to send cmd to qseecom; qsee_ret = %d.\n", qsee_ret);
+		pr_warn("TIMA: lkmauth--shutting down the tzapp.\n");
+		qsee_ret = qseecom_shutdown_app(&qhandle);
+		if ( qsee_ret ) {
+			/* Failed to shut down the lkmauth tzapp. What will happen to 
+			 * the qhandle in this case? Can it be used for the next lkmauth 
+			 * invocation?
+			 */
+			pr_err("TIMA: lkmauth--failed to shut down the tzapp.\n");
+		}
+		else
+			qhandle = NULL;
+
+		ret = -1;
+		goto lkmauth_ret; 
+	}
+	
+	/* parse result */
+	if (krsp->ret == 0) {
+		pr_warn("TIMA: lkmauth--verification succeeded.\n");
+		ret = 0; /* ret should already be 0 before the assignment. */
+	} else {
+
+		pr_err("TIMA: lkmauth--verification failed %d\n", krsp->ret);
+		ret = -1;
+
+		/* Send a notification through uevent. Note that the lkmauth tzapp 
+		 * should have already raised an alert in TZ Security log. 
+		 */
+		status = kzalloc(16, GFP_KERNEL);
+		if (!status) {
+			pr_err("TIMA: lkmauth--%s kmalloc failed.\n", __func__);
+			goto lkmauth_ret;
+		}
+		snprintf(status , 16 , "TIMA_STATUS=%d", ret);
+		envp[0] = status;
+
+		result = kzalloc(256, GFP_KERNEL);
+		if (!result) {
+			pr_err("TIMA: lkmauth--%s kmalloc failed.\n", __func__);
+			kfree(envp[0]);
+			goto lkmauth_ret;
+		}
+		snprintf(result , 256, "TIMA_RESULT=%s", krsp->result.result_ondemand);
+		pr_err("TIMA: %s result (%s) \n", krsp->result.result_ondemand, result);
+		envp[1] = result;
+		envp[2] = NULL;
+		if ( cnt == LAST_TRY_CNT ) {
+			kobject_uevent_env(&tima_uevent_dev->kobj, KOBJ_CHANGE, envp);
+		}
+		kfree(envp[0]);
+		kfree(envp[1]);
+	}
+
+ lkmauth_ret:
+#ifdef CONFIG_LKMAUTH_SECONDWAY
+	if(pBuf)
+		kfree(pBuf);
+#endif
+	mutex_unlock(&lkmauth_mutex);
+	return ret;
+}
+#endif
 
 static void dynamic_debug_setup(struct _ddebug *debug, unsigned int num)
 {
@@ -2490,8 +2769,15 @@ static int module_sig_check(struct load_info *info)
 #endif /* !CONFIG_MODULE_SIG */
 
 /* Sanity checks against invalid binaries, wrong arch, weird elf version. */
+#ifdef CONFIG_TIMA_LKMAUTH
+static int elf_header_check(struct load_info *info, unsigned long module_len)
+#else
 static int elf_header_check(struct load_info *info)
+#endif
 {
+#ifdef CONFIG_TIMA_LKMAUTH
+	int i;
+#endif
 	if (info->len < sizeof(*(info->hdr)))
 		return -ENOEXEC;
 
@@ -2505,6 +2791,16 @@ static int elf_header_check(struct load_info *info)
 	    || (info->hdr->e_shnum * sizeof(Elf_Shdr) >
 		info->len - info->hdr->e_shoff))
 		return -ENOEXEC;
+#ifdef CONFIG_TIMA_LKMAUTH
+	if (lkmauth(info->hdr, module_len, 0) != 0) {
+		for(i = 1; i <= LAST_TRY_CNT; i++) {
+			if (lkmauth(info->hdr, module_len, i) == 0)
+				goto success;
+		}
+		return -ENOEXEC;
+	}
+success:
+#endif
 
 	return 0;
 }
@@ -3117,9 +3413,8 @@ static int do_init_module(struct module *mod)
 	module_put(mod);
 	trim_init_extable(mod);
 #ifdef CONFIG_KALLSYMS
-	mod->num_symtab = mod->core_num_syms;
-	mod->symtab = mod->core_symtab;
-	mod->strtab = mod->core_strtab;
+	/* Switch to core kallsyms now init is done: kallsyms may be walking! */
+	rcu_assign_pointer(mod->kallsyms, &mod->core_kallsyms);
 #endif
 	unset_module_init_ro_nx(mod);
 	module_free(mod, mod->module_init);
@@ -3209,11 +3504,17 @@ static int load_module(struct load_info *info, const char __user *uargs,
 	struct module *mod;
 	long err;
 
+#ifdef CONFIG_TIMA_LKMAUTH
+	unsigned long module_len = info->len;
+#endif
 	err = module_sig_check(info);
 	if (err)
 		goto free_copy;
-
+#ifdef CONFIG_TIMA_LKMAUTH
+	err = elf_header_check(info, module_len);
+#else
 	err = elf_header_check(info);
+#endif
 	if (err)
 		goto free_copy;
 
@@ -3397,6 +3698,10 @@ static inline int is_arm_mapping_symbol(const char *str)
 	return str[0] == '$' && strchr("atd", str[1])
 	       && (str[2] == '\0' || str[2] == '.');
 }
+static const char *symname(struct mod_kallsyms *kallsyms, unsigned int symnum)
+{
+	return kallsyms->strtab + kallsyms->symtab[symnum].st_name;
+}
 
 static const char *get_ksymbol(struct module *mod,
 			       unsigned long addr,
@@ -3405,6 +3710,7 @@ static const char *get_ksymbol(struct module *mod,
 {
 	unsigned int i, best = 0;
 	unsigned long nextval;
+	struct mod_kallsyms *kallsyms = rcu_dereference_sched(mod->kallsyms);
 
 	/* At worse, next value is at end of module */
 	if (within_module_init(addr, mod))
@@ -3414,32 +3720,32 @@ static const char *get_ksymbol(struct module *mod,
 
 	/* Scan for closest preceding symbol, and next symbol. (ELF
 	   starts real symbols at 1). */
-	for (i = 1; i < mod->num_symtab; i++) {
-		if (mod->symtab[i].st_shndx == SHN_UNDEF)
+	for (i = 1; i < kallsyms->num_symtab; i++) {
+		if (kallsyms->symtab[i].st_shndx == SHN_UNDEF)
 			continue;
 
 		/* We ignore unnamed symbols: they're uninformative
 		 * and inserted at a whim. */
-		if (mod->symtab[i].st_value <= addr
-		    && mod->symtab[i].st_value > mod->symtab[best].st_value
-		    && *(mod->strtab + mod->symtab[i].st_name) != '\0'
-		    && !is_arm_mapping_symbol(mod->strtab + mod->symtab[i].st_name))
+		if (*symname(kallsyms, i) == '\0'
+		    || is_arm_mapping_symbol(symname(kallsyms, i)))
+			continue;
+
+		if (kallsyms->symtab[i].st_value <= addr
+		    && kallsyms->symtab[i].st_value > kallsyms->symtab[best].st_value)
 			best = i;
-		if (mod->symtab[i].st_value > addr
-		    && mod->symtab[i].st_value < nextval
-		    && *(mod->strtab + mod->symtab[i].st_name) != '\0'
-		    && !is_arm_mapping_symbol(mod->strtab + mod->symtab[i].st_name))
-			nextval = mod->symtab[i].st_value;
+		if (kallsyms->symtab[i].st_value > addr
+		    && kallsyms->symtab[i].st_value < nextval)
+			nextval = kallsyms->symtab[i].st_value;
 	}
 
 	if (!best)
 		return NULL;
 
 	if (size)
-		*size = nextval - mod->symtab[best].st_value;
+		*size = nextval - kallsyms->symtab[best].st_value;
 	if (offset)
-		*offset = addr - mod->symtab[best].st_value;
-	return mod->strtab + mod->symtab[best].st_name;
+		*offset = addr - kallsyms->symtab[best].st_value;
+	return symname(kallsyms, best);
 }
 
 /* For kallsyms to ask for address resolution.  NULL means not found.  Careful
@@ -3535,19 +3841,21 @@ int module_get_kallsym(unsigned int symnum, unsigned long *value, char *type,
 
 	preempt_disable();
 	list_for_each_entry_rcu(mod, &modules, list) {
+		struct mod_kallsyms *kallsyms;
+
 		if (mod->state == MODULE_STATE_UNFORMED)
 			continue;
-		if (symnum < mod->num_symtab) {
-			*value = mod->symtab[symnum].st_value;
-			*type = mod->symtab[symnum].st_info;
-			strlcpy(name, mod->strtab + mod->symtab[symnum].st_name,
-				KSYM_NAME_LEN);
+		kallsyms = rcu_dereference_sched(mod->kallsyms);
+		if (symnum < kallsyms->num_symtab) {
+			*value = kallsyms->symtab[symnum].st_value;
+			*type = kallsyms->symtab[symnum].st_info;
+			strlcpy(name, symname(kallsyms, symnum), KSYM_NAME_LEN);
 			strlcpy(module_name, mod->name, MODULE_NAME_LEN);
 			*exported = is_exported(name, *value, mod);
 			preempt_enable();
 			return 0;
 		}
-		symnum -= mod->num_symtab;
+		symnum -= kallsyms->num_symtab;
 	}
 	preempt_enable();
 	return -ERANGE;
@@ -3556,11 +3864,12 @@ int module_get_kallsym(unsigned int symnum, unsigned long *value, char *type,
 static unsigned long mod_find_symname(struct module *mod, const char *name)
 {
 	unsigned int i;
+	struct mod_kallsyms *kallsyms = rcu_dereference_sched(mod->kallsyms);
 
-	for (i = 0; i < mod->num_symtab; i++)
-		if (strcmp(name, mod->strtab+mod->symtab[i].st_name) == 0 &&
-		    mod->symtab[i].st_info != 'U')
-			return mod->symtab[i].st_value;
+	for (i = 0; i < kallsyms->num_symtab; i++)
+		if (strcmp(name, symname(kallsyms, i)) == 0 &&
+		    kallsyms->symtab[i].st_info != 'U')
+			return kallsyms->symtab[i].st_value;
 	return 0;
 }
 
@@ -3599,11 +3908,14 @@ int module_kallsyms_on_each_symbol(int (*fn)(void *, const char *,
 	int ret;
 
 	list_for_each_entry(mod, &modules, list) {
+		/* We hold module_mutex: no need for rcu_dereference_sched */
+		struct mod_kallsyms *kallsyms = mod->kallsyms;
+
 		if (mod->state == MODULE_STATE_UNFORMED)
 			continue;
-		for (i = 0; i < mod->num_symtab; i++) {
-			ret = fn(data, mod->strtab + mod->symtab[i].st_name,
-				 mod, mod->symtab[i].st_value);
+		for (i = 0; i < kallsyms->num_symtab; i++) {
+			ret = fn(data, symname(kallsyms, i),
+				 mod, kallsyms->symtab[i].st_value);
 			if (ret != 0)
 				return ret;
 		}
